@@ -175,16 +175,37 @@ class CmdAdapter(BaseAgentAdapter):
                     msg_id = f"msg_{idx}_{uuid.uuid4().hex[:8]}"
                     ts_iso = datetime.utcfromtimestamp(turn.timestamp or time.time()).isoformat() + "Z"
                     ts_ms = int((turn.timestamp or time.time()) * 1000)
+                    msg_data = {
+                        "role": turn.role,
+                        "content": [{"type": "text", "text": turn.text}],
+                        "timestamp": ts_ms
+                    }
+                    if turn.role == "assistant":
+                        msg_data["api"] = "anthropic-messages"
+                        msg_data["provider"] = "anthropic"
+                        msg_data["model"] = "claude-3-5-sonnet"
+                        msg_data["stopReason"] = "endTurn"
+                        msg_data["usage"] = {
+                            "input": 0,
+                            "output": 0,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                            "totalTokens": 0,
+                            "cost": {
+                                "input": 0.0,
+                                "output": 0.0,
+                                "cacheRead": 0.0,
+                                "cacheWrite": 0.0,
+                                "total": 0.0
+                            }
+                        }
+
                     line_obj = {
                         "type": "message",
                         "id": msg_id,
                         "parentId": prev_id,
                         "timestamp": ts_iso,
-                        "message": {
-                            "role": turn.role,
-                            "content": [{"type": "text", "text": turn.text}],
-                            "timestamp": ts_ms
-                        }
+                        "message": msg_data
                     }
                     fp.write(json.dumps(line_obj) + "\n")
                     prev_id = msg_id
