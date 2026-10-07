@@ -31,17 +31,30 @@ class OpenCodeAdapter(BaseAgentAdapter):
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
 
-            query = "SELECT id, project_id, directory, title, time_created, time_updated FROM session WHERE parent_id IS NULL AND (title NOT LIKE '%(@%subagent)%' OR title IS NULL)"
-            params = []
-            if norm_folder:
-                query += " AND directory = ?"
-                params = [norm_folder]
-            query += " ORDER BY time_updated DESC"
+            existing_tables = set(r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall())
 
-            rows = c.execute(query, params).fetchall()
+            session_tables = ["session"]
+            if "session_v2" in existing_tables:
+                session_tables.append("session_v2")
 
-            for r in rows:
-                sid = r["id"]
+            seen_rows = {}
+            for tbl in session_tables:
+                query = f"SELECT id, project_id, directory, title, time_created, time_updated FROM {tbl} WHERE parent_id IS NULL AND (title NOT LIKE '%(@%subagent)%' OR title IS NULL)"
+                params = []
+                if norm_folder:
+                    query += " AND directory = ?"
+                    params = [norm_folder]
+                query += " ORDER BY time_updated DESC"
+
+                for r in c.execute(query, params).fetchall():
+                    sid = r["id"]
+                    if sid not in seen_rows or (r["time_updated"] or 0) > (seen_rows[sid]["time_updated"] or 0):
+                        seen_rows[sid] = r
+
+            has_session_message = "session_message" in existing_tables
+            has_message = "message" in existing_tables
+
+            for sid, r in seen_rows.items():
                 cwd = self.normalize_cwd(r["directory"])
                 if norm_folder and cwd != norm_folder:
                     continue
@@ -56,8 +69,11 @@ class OpenCodeAdapter(BaseAgentAdapter):
                     if len(parts) >= 3:
                         origin = parts[2]
 
-                # Get count of turns
-                turn_c = c.execute("SELECT COUNT(*) FROM message WHERE session_id = ?", (sid,)).fetchone()[0]
+                turn_c = 0
+                if has_message:
+                    turn_c = c.execute("SELECT COUNT(*) FROM message WHERE session_id = ?", (sid,)).fetchone()[0]
+                if turn_c == 0 and has_session_message:
+                    turn_c = c.execute("SELECT COUNT(*) FROM session_message WHERE session_id = ?", (sid,)).fetchone()[0]
 
                 sessions.append(UnifiedSession(
                     session_id=f"opencode:{sid}",
@@ -76,6 +92,7 @@ class OpenCodeAdapter(BaseAgentAdapter):
         except Exception:
             pass
 
+        sessions.sort(key=lambda s: s.updated_at, reverse=True)
         return sessions
 
     def load_turns(self, session: UnifiedSession) -> List[Turn]:
@@ -88,38 +105,63 @@ class OpenCodeAdapter(BaseAgentAdapter):
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
 
-            messages = c.execute(
-                "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created ASC",
-                (session.native_id,)
-            ).fetchall()
+            existing_tables = set(r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall())
 
-            for m in messages:
-                mid = m["id"]
-                m_data = json.loads(m["data"]) if m["data"] else {}
-                role = m_data.get("role", "user")
-                ts = (m["time_created"] or 0) / 1000.0
-
-                # Get parts
-                parts = c.execute(
-                    "SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC",
-                    (mid,)
+            if "message" in existing_tables:
+                messages = c.execute(
+                    "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created ASC",
+                    (session.native_id,)
                 ).fetchall()
 
-                text_parts = []
-                for p in parts:
-                    try:
-                        p_data = json.loads(p["data"]) if p["data"] else {}
-                        if p_data.get("type") == "text":
-                            text_parts.append(p_data.get("text", ""))
-                    except Exception:
-                        continue
+                for m in messages:
+                    mid = m["id"]
+                    m_data = json.loads(m["data"]) if m["data"] else {}
+                    role = m_data.get("role", "user")
+                    ts = (m["time_created"] or 0) / 1000.0
 
-                text = "\n".join(text_parts).strip()
-                if not text and "text" in m_data:
-                    text = m_data["text"]
+                    text_parts = []
+                    if "part" in existing_tables:
+                        parts = c.execute(
+                            "SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC",
+                            (mid,)
+                        ).fetchall()
 
-                if text:
-                    turns.append(Turn(role=role, text=text, timestamp=ts))
+                        for p in parts:
+                            try:
+                                p_data = json.loads(p["data"]) if p["data"] else {}
+                                if p_data.get("type") == "text":
+                                    text_parts.append(p_data.get("text", ""))
+                            except Exception:
+                                continue
+
+                    text = "\n".join(text_parts).strip()
+                    if not text and "text" in m_data:
+                        text = m_data["text"]
+
+                    if text:
+                        turns.append(Turn(role=role, text=text, timestamp=ts))
+
+            # Fallback to session_message for OpenCode 2.0 sessions
+            if not turns and "session_message" in existing_tables:
+                s_messages = c.execute(
+                    "SELECT id, type, time_created, data FROM session_message WHERE session_id = ? ORDER BY seq ASC",
+                    (session.native_id,)
+                ).fetchall()
+
+                for sm in s_messages:
+                    role = sm["type"] or "user"
+                    ts = (sm["time_created"] or 0) / 1000.0
+                    sm_data = json.loads(sm["data"]) if sm["data"] else {}
+                    text = ""
+                    if role == "user":
+                        text = sm_data.get("text", "")
+                    else:
+                        content = sm_data.get("content", [])
+                        text_parts = [part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"]
+                        text = "\n".join(text_parts).strip()
+
+                    if text:
+                        turns.append(Turn(role=role, text=text, timestamp=ts))
 
             conn.close()
         except Exception:
@@ -133,6 +175,8 @@ class OpenCodeAdapter(BaseAgentAdapter):
         try:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
+
+            existing_tables = set(r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall())
 
             # Find matching project_id for directory
             p_row = c.execute(
@@ -151,27 +195,105 @@ class OpenCodeAdapter(BaseAgentAdapter):
                 INSERT OR REPLACE INTO session
                 (id, project_id, directory, path, slug, title, version, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, agent, model, time_created, time_updated)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 0, 0, 0, 0, 0, 'build', '{"id":"synced","providerID":"local"}', ?, ?)
-            """, (mirror_id, project_id, session.cwd, session.cwd.strip("/"), slug, title, "1.17.8", created_ms, updated_ms))
+            """, (mirror_id, project_id, session.cwd, session.cwd.strip("/"), slug, title, "1.18.35", created_ms, updated_ms))
+
+            if "session_v2" in existing_tables:
+                c.execute("""
+                    INSERT OR REPLACE INTO session_v2
+                    (id, project_id, directory, path, slug, title, version, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, agent, model, time_created, time_updated, resume_attempts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 0, 0, 0, 0, 0, 'build', '{"id":"synced","providerID":"local"}', ?, ?, 0)
+                """, (mirror_id, project_id, session.cwd, session.cwd.strip("/"), slug, title, "1.18.35", created_ms, updated_ms))
 
             # Delete old messages for this mirror session to avoid duplicates
-            c.execute("DELETE FROM part WHERE session_id = ?", (mirror_id,))
-            c.execute("DELETE FROM message WHERE session_id = ?", (mirror_id,))
+            if "part" in existing_tables:
+                c.execute("DELETE FROM part WHERE session_id = ?", (mirror_id,))
+            if "message" in existing_tables:
+                c.execute("DELETE FROM message WHERE session_id = ?", (mirror_id,))
+            if "session_message" in existing_tables:
+                c.execute("DELETE FROM session_message WHERE session_id = ?", (mirror_id,))
 
+            last_user_msg_id = None
             for idx, turn in enumerate(session.turns):
                 msg_id = f"msg_sync_{idx}_{uuid.uuid4().hex[:12]}"
                 t_ms = int((turn.timestamp or time.time()) * 1000)
-                m_data = json.dumps({"role": turn.role, "time": {"created": t_ms}})
-                c.execute("""
-                    INSERT INTO message (id, session_id, time_created, time_updated, data)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (msg_id, mirror_id, t_ms, t_ms, m_data))
+                role = turn.role if turn.role in ("user", "assistant") else "user"
 
-                prt_id = f"prt_sync_{idx}_{uuid.uuid4().hex[:12]}"
-                p_data = json.dumps({"type": "text", "text": turn.text})
-                c.execute("""
-                    INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (prt_id, msg_id, mirror_id, t_ms, t_ms, p_data))
+                if role == "assistant":
+                    m_data = json.dumps({
+                        "parentID": last_user_msg_id,
+                        "role": "assistant",
+                        "mode": "build",
+                        "agent": "build",
+                        "path": {"cwd": session.cwd, "root": session.cwd},
+                        "cost": 0.0,
+                        "tokens": {
+                            "total": 0,
+                            "input": 0,
+                            "output": 0,
+                            "reasoning": 0,
+                            "cache": {"write": 0, "read": 0}
+                        },
+                        "modelID": "synced",
+                        "providerID": "opencode",
+                        "time": {"created": t_ms, "completed": t_ms},
+                        "finish": "stop"
+                    })
+                else:
+                    last_user_msg_id = msg_id
+                    m_data = json.dumps({
+                        "role": "user",
+                        "time": {"created": t_ms},
+                        "agent": "build",
+                        "model": {"providerID": "opencode", "modelID": "synced"},
+                        "summary": {"diffs": []}
+                    })
+
+                if "message" in existing_tables:
+                    c.execute("""
+                        INSERT INTO message (id, session_id, time_created, time_updated, data)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (msg_id, mirror_id, t_ms, t_ms, m_data))
+
+                if "part" in existing_tables:
+                    prt_id = f"prt_sync_{idx}_{uuid.uuid4().hex[:12]}"
+                    p_data = json.dumps({
+                        "type": "text",
+                        "text": str(turn.text or ""),
+                        "time": {"start": t_ms, "end": t_ms}
+                    })
+                    c.execute("""
+                        INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (prt_id, msg_id, mirror_id, t_ms, t_ms, p_data))
+
+                if "session_message" in existing_tables:
+                    if role == "assistant":
+                        sm_data = json.dumps({
+                            "time": {"created": t_ms, "completed": t_ms},
+                            "agent": "build",
+                            "model": {"id": "synced", "providerID": "opencode", "variant": "default"},
+                            "content": [{"type": "text", "text": str(turn.text or "")}],
+                            "finish": "stop",
+                            "cost": 0.0,
+                            "tokens": {
+                                "total": 0,
+                                "input": 0,
+                                "output": 0,
+                                "reasoning": 0,
+                                "cache": {"read": 0, "write": 0}
+                            }
+                        })
+                    else:
+                        sm_data = json.dumps({
+                            "time": {"created": t_ms},
+                            "text": str(turn.text or ""),
+                            "files": [],
+                            "agents": []
+                        })
+                    c.execute("""
+                        INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (msg_id, mirror_id, role, idx, t_ms, t_ms, sm_data))
 
             conn.commit()
             conn.close()
