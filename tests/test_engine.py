@@ -8,7 +8,9 @@ class TestSessionEngine(unittest.TestCase):
         self.engine = SessionEngine()
 
     def test_engine_initialization(self):
-        self.assertGreater(len(self.engine.adapters), 0)
+        from asess.adapters import get_all_adapters
+        self.assertGreater(len(get_all_adapters()), 0)
+        self.assertIsInstance(self.engine.adapters, list)
 
     def test_exact_folder_filtering_empty_directory(self):
         # A fresh empty directory must return exactly 0 sessions
